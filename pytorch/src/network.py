@@ -7,7 +7,7 @@ from torch.autograd import Variable
 import math
 
 class AlexNetFc(nn.Module):
-  def __init__(self, hash_bit):
+  def __init__(self, hash_bit,use_hashnet=True):
     super(AlexNetFc, self).__init__()
     model_alexnet = models.alexnet(pretrained=True)
     self.features = model_alexnet.features

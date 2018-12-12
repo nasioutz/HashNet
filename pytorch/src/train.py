@@ -1,8 +1,7 @@
 import argparse
 import os
 import os.path as osp
-
-import numpy as np
+from os.path import join
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -14,13 +13,19 @@ import lr_schedule
 import data_list
 from data_list import ImageList
 from torch.autograd import Variable
+from time import localtime
+from tqdm import tqdm
+from tqdm import trange
+
+import test
 
 optim_dict = {"SGD": optim.SGD}
+
 
 def image_classification_predict(loader, model, test_10crop=True, gpu=True, softmax_param=1.0):
     start_test = True
     if test_10crop:
-        iter_test = [iter(loader['test'+str(i)]) for i in range(10)]
+        iter_test = [iter(loader['test' + str(i)]) for i in range(10)]
         for i in range(len(loader['test0'])):
             data = [iter_test[j].next() for j in range(10)]
             inputs = [data[j][0] for j in range(10)]
@@ -73,10 +78,11 @@ def image_classification_predict(loader, model, test_10crop=True, gpu=True, soft
     _, predict = torch.max(all_output, 1)
     return all_softmax_output, predict, all_output, all_label
 
+
 def image_classification_test(loader, model, test_10crop=True, gpu=True):
     start_test = True
     if test_10crop:
-        iter_test = [iter(loader['test'+str(i)]) for i in range(10)]
+        iter_test = [iter(loader['test' + str(i)]) for i in range(10)]
         for i in range(len(loader['test0'])):
             data = [iter_test[j].next() for j in range(10)]
             inputs = [data[j][0] for j in range(10)]
@@ -120,7 +126,7 @@ def image_classification_test(loader, model, test_10crop=True, gpu=True):
                 start_test = False
             else:
                 all_output = torch.cat((all_output, outputs.data.float()), 0)
-                all_label = torch.cat((all_label, labels.data.float()), 0)       
+                all_label = torch.cat((all_label, labels.data.float()), 0)
     _, predict = torch.max(all_output, 1)
     accuracy = torch.sum(torch.squeeze(predict).float() == all_label) / float(all_label.size()[0])
     return accuracy
@@ -131,26 +137,28 @@ def train(config):
     prep_dict = {}
     prep_config = config["prep"]
     prep_dict["train_set1"] = prep.image_train( \
-                            resize_size=prep_config["resize_size"], \
-                            crop_size=prep_config["crop_size"])
+        resize_size=prep_config["resize_size"], \
+        crop_size=prep_config["crop_size"])
     prep_dict["train_set2"] = prep.image_train( \
-                            resize_size=prep_config["resize_size"], \
-                            crop_size=prep_config["crop_size"])
+        resize_size=prep_config["resize_size"], \
+        crop_size=prep_config["crop_size"])
 
     ## prepare data
     dsets = {}
     dset_loaders = {}
     data_config = config["data"]
-    dsets["train_set1"] = ImageList(open(data_config["train_set1"]["list_path"]).readlines(), \
-                                transform=prep_dict["train_set1"])
-    dset_loaders["train_set1"] = util_data.DataLoader(dsets["train_set1"], \
-            batch_size=data_config["train_set1"]["batch_size"], \
-            shuffle=True, num_workers=4)
-    dsets["train_set2"] = ImageList(open(data_config["train_set2"]["list_path"]).readlines(), \
-                                transform=prep_dict["train_set2"])
-    dset_loaders["train_set2"] = util_data.DataLoader(dsets["train_set2"], \
-            batch_size=data_config["train_set2"]["batch_size"], \
-            shuffle=True, num_workers=4)
+    dsets["train_set1"] = ImageList(open(data_config["train_set1"]["list_path"]).readlines(),
+                                    transform=prep_dict["train_set1"])
+    dset_loaders["train_set1"] = util_data.DataLoader(dsets["train_set1"],
+                                                      batch_size=data_config["train_set1"]["batch_size"],
+                                                      shuffle=True, num_workers=data_config["train_set2"]['workers'],
+                                                      pin_memory=True)
+    dsets["train_set2"] = ImageList(open(data_config["train_set2"]["list_path"]).readlines(),
+                                    transform=prep_dict["train_set2"])
+    dset_loaders["train_set2"] = util_data.DataLoader(dsets["train_set2"],
+                                                      batch_size=data_config["train_set2"]["batch_size"],
+                                                      shuffle=True, num_workers=data_config["train_set2"]['workers'],
+                                                      pin_memory=True)
 
     hash_bit = config["hash_bit"]
 
@@ -163,29 +171,36 @@ def train(config):
         base_network = base_network.cuda()
 
     ## collect parameters
-    parameter_list = [{"params":base_network.feature_layers.parameters(), "lr":1}, \
-                      {"params":base_network.hash_layer.parameters(), "lr":10}]
- 
+    parameter_list = [{"params": base_network.feature_layers.parameters(), "lr": 1}, \
+                      {"params": base_network.hash_layer.parameters(), "lr": 10}]
+
     ## set optimizer
     optimizer_config = config["optimizer"]
     optimizer = optim_dict[optimizer_config["type"]](parameter_list, \
-                    **(optimizer_config["optim_params"]))
+
+                                                     **(optimizer_config["optim_params"]))
+
+    ## set loss function
+
+    #loss_f = loss.pairwise_loss
+    loss_f = loss.cauchy_cross_entropy_loss
+
     param_lr = []
     for param_group in optimizer.param_groups:
         param_lr.append(param_group["lr"])
     schedule_param = optimizer_config["lr_param"]
     lr_scheduler = lr_schedule.schedule_dict[optimizer_config["lr_type"]]
 
-
-    ## train   
+    ## train
     len_train1 = len(dset_loaders["train_set1"]) - 1
     len_train2 = len(dset_loaders["train_set2"]) - 1
     transfer_loss_value = classifier_loss_value = total_loss_value = 0.0
     best_acc = 0.0
-    for i in range(config["num_iterations"]):
+    t_range = trange(config["num_iterations"], desc="Loss Value", leave=True)
+    for i in t_range:
         if i % config["snapshot_interval"] == 0:
             torch.save(nn.Sequential(base_network), osp.join(config["output_path"], \
-                "iter_{:05d}_model.pth.tar".format(i)))
+                                                             "iter_{:05d}_model.pth.tar".format(i)))
 
         ## train one iter
         base_network.train(True)
@@ -203,22 +218,103 @@ def train(config):
                 Variable(labels1).cuda(), Variable(labels2).cuda()
         else:
             inputs1, inputs2, labels1, labels2 = Variable(inputs1), \
-                Variable(inputs2), Variable(labels1), Variable(labels2)
-           
+                                                 Variable(inputs2), Variable(labels1), Variable(labels2)
+
         inputs = torch.cat((inputs1, inputs2), dim=0)
-        outputs = base_network(inputs)
-        similarity_loss = loss.pairwise_loss(outputs.narrow(0,0,inputs1.size(0)), \
-                                 outputs.narrow(0,inputs1.size(0),inputs2.size(0)), \
-                                 labels1, labels2, \
-                                 sigmoid_param=config["loss"]["sigmoid_param"], \
-                                 l_threshold=config["loss"]["l_threshold"], \
-                                 class_num=config["loss"]["class_num"])
+        outputs = base_network(inputs1)
+        outputs = torch.cat((outputs, outputs), dim=0)
+
+        similarity_loss = loss_f(outputs.narrow(0, 0, inputs1.size(0)), \
+                                             outputs.narrow(0, inputs1.size(0), inputs2.size(0)), \
+                                             labels1, labels2, \
+                                             config_loss=config["loss"])
 
         similarity_loss.backward()
-        print("Iter: {:05d}, loss: {:.3f}".format(i, similarity_loss.float().data[0]))
+
+        t_range.set_description("Loss Value: %f" % similarity_loss.float().data[0])
+        t_range.refresh()
+        # print("Iter: {:05d}, loss: {:.3f}".format(i, similarity_loss.float().data[0]))
+
         config["out_file"].write("Iter: {:05d}, loss: {:.3f}".format(i, \
-            similarity_loss.float().data[0]))
+                                                                     similarity_loss.float().data[0]))
         optimizer.step()
+
+
+class Arguments:
+    def __init__(self, gpu_id='0', dataset='nus_wide', hash_bit=48, lr=0.0003, class_num=1.0, net='ResNet50',
+                 batch_size=36, workers=8):
+        from time import localtime
+
+        timestamp = str(localtime().tm_year) + '_' + str(localtime().tm_mon) + '_' + str(
+            localtime().tm_mday) + '_' + str(
+            localtime().tm_hour) + '_' + str(localtime().tm_min) + '_' + str(localtime().tm_sec)
+
+        self.prefix = timestamp
+        self.gpu_id = gpu_id
+        self.dataset = dataset
+        self.hash_bit = hash_bit
+        self.lr = lr
+        self.class_num = class_num
+        self.net = net
+        self.workers = workers
+        self.batch_size = batch_size
+
+
+def produce_config(args):
+    os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu_id
+
+    # train config
+    config = {}
+    config["num_iterations"] = 10000
+    config["snapshot_interval"] = 500
+    config["dataset"] = args.dataset
+    config["hash_bit"] = args.hash_bit
+    config["output_path"] = join('snapshot', config["dataset"] + "_" + str(config["hash_bit"]) + "bit_" + args.prefix)
+    if not osp.exists(config["output_path"]):
+        os.makedirs(config["output_path"])
+    config["out_file"] = open(join(config["output_path"], "log.txt"), "w")
+
+    if not osp.exists(config["output_path"]):
+        os.makedirs(config["output_path"])
+    config["network"] = {}
+    if "ResNet" in args.net:
+        config["network"]["type"] = network.ResNetFc
+        config["network"]["params"] = {"name": args.net
+            , "hash_bit": config["hash_bit"]}
+    elif "VGG" in args.net:
+        config["network"]["type"] = network.VGGFc
+        config["network"]["params"] = {"name": args.net, "hash_bit": config["hash_bit"]}
+    elif "AlexNet" in args.net:
+        config["network"]["type"] = network.AlexNetFc
+        config["network"]["params"] = {"hash_bit": config["hash_bit"]}
+    config["prep"] = {"test_10crop": True, "resize_size": 256, "crop_size": 224}
+    config["optimizer"] = {"type": "SGD", "optim_params": {"lr": 1.0, "momentum": 0.9, \
+                                                           "weight_decay": 0.0005, "nesterov": True}, "lr_type": "step", \
+                           "lr_param": {"init_lr": args.lr, "gamma": 0.5, "step": 2000}}
+
+    config["loss"] = {"l_weight": 1.0, "q_weight": 0, "l_threshold": 15.0, "sigmoid_param": 10. / config["hash_bit"],
+                      "class_num": args.class_num, "gamma":1.0, "q_lambda":0.0}
+
+    if config["dataset"] == "imagenet":
+        config["data"] = {
+            "train_set1": {"list_path": join('data', 'imagenet', 'train.txt'), "batch_size": args.batch_size,
+                           "workers": args.workers}, \
+            "train_set2": {"list_path": join('data', 'imagenet', 'train.txt'), "batch_size": args.batch_size,
+                           "workers": args.workers}}
+    elif config["dataset"] == "nus_wide":
+        config["data"] = {
+            "train_set1": {"list_path": join('data', 'nuswide_81', 'train.txt'), "batch_size": args.batch_size,
+                           "workers": args.workers}, \
+            "train_set2": {"list_path": join('data', 'nuswide_81', 'train.txt'), "batch_size": args.batch_size,
+                           "workers": args.workers}}
+    elif config["dataset"] == "coco":
+        config["data"] = {"train_set1": {"list_path": join('data', 'coco', 'train.txt'), "batch_size": args.batch_size,
+                                         "workers": args.workers}, \
+                          "train_set2": {"list_path": join('data', 'coco', 'train.txt'), "batch_size": args.batch_size,
+                                         "workers": args.workers}}
+
+    return config
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='HashNet')
@@ -227,50 +323,14 @@ if __name__ == "__main__":
     parser.add_argument('--hash_bit', type=int, default=48, help="number of hash code bits")
     parser.add_argument('--net', type=str, default='ResNet50', help="base network type")
     parser.add_argument('--prefix', type=str, help="save path prefix")
-    parser.add_argument('--lr', type=float, help="learning rate")
-    parser.add_argument('--class_num', type=float, help="positive negative pairs balance weight")
+    parser.add_argument('--lr', type=float, default=0.0003, help="learning rate")
+    parser.add_argument('--class_num', type=float, default=2.0, help="positive negative pairs balance weight")
     args = parser.parse_args()
-    os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu_id 
 
-    # train config  
-    config = {}
-    config["num_iterations"] = 10000
-    config["snapshot_interval"] = 3000
-    config["dataset"] = args.dataset
-    config["hash_bit"] = args.hash_bit
-    config["output_path"] = "../snapshot/"+config["dataset"]+"_"+ \
-                            str(config["hash_bit"])+"bit_"+args.prefix
-    if not osp.exists(config["output_path"]):
-        os.mkdir(config["output_path"])
-    config["out_file"] = open(osp.join(config["output_path"], "log.txt"), "w")
+    args = Arguments(hash_bit=48, net='AlexNet', class_num=1000.0)
 
-    if not osp.exists(config["output_path"]):
-        os.mkdir(config["output_path"])
-    config["network"] = {}
-    if "ResNet" in args.net:
-        config["network"]["type"] = network.ResNetFc
-        config["network"]["params"] = {"name":args.net, "hash_bit":config["hash_bit"]}
-    elif "VGG" in args.net:
-        config["network"]["type"] = network.VGGFc
-        config["network"]["params"] = {"name":args.net, "hash_bit":config["hash_bit"]}
-    elif "AlexNet" in args.net:
-        config["network"]["type"] = network.AlexNetFc
-        config["network"]["params"] = {"hash_bit":config["hash_bit"]}
-    config["prep"] = {"test_10crop":True, "resize_size":256, "crop_size":224}
-    config["optimizer"] = {"type":"SGD", "optim_params":{"lr":1.0, "momentum":0.9, \
-                           "weight_decay":0.0005, "nesterov":True}, "lr_type":"step", \
-                           "lr_param":{"init_lr":args.lr, "gamma":0.5, "step":2000} }
+    config = produce_config(args)
 
-    config["loss"] = {"l_weight":1.0, "q_weight":0, "l_threshold":15.0, "sigmoid_param":10./config["hash_bit"], "class_num":args.class_num}
+    print("\n" + config["loss"] + "\n")
 
-    if config["dataset"] == "imagenet":
-        config["data"] = {"train_set1":{"list_path":"../data/imagenet/train.txt", "batch_size":36}, \
-                          "train_set2":{"list_path":"../data/imagenet/train.txt", "batch_size":36}}
-    elif config["dataset"] == "nus_wide":
-        config["data"] = {"train_set1":{"list_path":"../data/nus_wide/train.txt", "batch_size":36}, \
-                          "train_set2":{"list_path":"../data/nus_wide/train.txt", "batch_size":36}}
-    elif config["dataset"] == "coco":
-        config["data"] = {"train_set1":{"list_path":"../data/coco/train.txt", "batch_size":36}, \
-                          "train_set2":{"list_path":"../data/coco/train.txt", "batch_size":36}}
-    print(config["loss"])
     train(config)
